@@ -1,0 +1,160 @@
+# aegi-action — the audit as a CI gate
+
+Runs the AegiLabs audit agent over a repository inside **the customer's own
+runner** — the checkout, the scanners and the agent all execute there, and we
+host no compute for it. Same trust boundary as the desktop `aegi` CLI: the repo
+is never cloned or uploaded to us, but the parts of it the agent reads are sent
+as model context through the metering proxy to Anthropic. See "What leaves your
+machine" in `product/aegi/README.md` — it applies identically here, with the
+runner in place of a laptop.
+
+Findings come back three ways: inline annotations on the pull request diff, a
+job summary table, and the branded PDF report as a run artifact.
+
+```yaml
+# .github/workflows/security.yml
+name: security
+on: [pull_request]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write        # only needed for comment-pr
+    steps:
+      - uses: actions/checkout@v7
+      - uses: AegiLabs/aegi-action@v1
+        with:
+          key: ${{ secrets.AEGI_KEY }}
+          fail-on: high
+          comment-pr: true
+```
+
+More variants in [`examples/`](examples/).
+
+## Inputs
+
+| Input | Default | What it does |
+|---|---|---|
+| `key` | — | The Aegi key. Put it in **Settings → Secrets → Actions** as `AEGI_KEY`; never inline it. Required unless `dry-run`. |
+| `dry-run` | `false` | Fabricate findings instead of calling the agent. Costs nothing, exercises the whole reporting path. See below. |
+| `target` | `.` | Path in the repo to audit, or a URL for a live assessment (a URL also needs `confirm-authorized: true`). |
+| `lang` | `en` | Report language — `en` or `sv`. |
+| `max-turns` | `30` | Agent turn cap. Higher digs deeper, costs more quota. Raise for large repos. |
+| `fail-on` | `critical` | Fail the job at this severity or worse: `critical`/`high`/`medium`/`low`/`info`/`none`. |
+| `scanners` | `gitleaks,osv-scanner,semgrep` | Scanners installed and run for grounding. `""` for none (findings become LLM-only). `trufflehog` also available. |
+| `pdf` | `true` | Install typst for the branded PDF; otherwise an HTML report. |
+| `upload-artifact` | `true` | Upload report + findings JSON + transcript. |
+| `artifact-name` | `aegi-report` | Artifact name (change it if a matrix runs several audits). |
+| `comment-pr` | `false` | Post one rolling summary comment on the PR. Needs `pull-requests: write`. |
+| `confirm-authorized` | `false` | Confirms authorization to actively test a URL target. Repo audits never need it. |
+| `aegi-version` | latest | Pin the `aegilabs` npm release, e.g. `0.2.0`. Pin it for reproducible gates. |
+| `node-version` | `24` | Node used to run the audit (needs 20+). |
+| `python-version` | `3.11` | Python for this action's own helper scripts. The audit no longer needs it. |
+| `proxy` | AegiLabs | Metering proxy override. Internal/staging only. |
+
+## Outputs
+
+`critical`, `high`, `medium`, `low`, `info`, `total`, `worst` (highest severity
+present, or `none`), and `report-dir`. Useful when you'd rather gate yourself
+than use `fail-on`:
+
+```yaml
+      - uses: AegiLabs/aegi-action@v1
+        id: audit
+        with:
+          key: ${{ secrets.AEGI_KEY }}
+          fail-on: none
+      - if: ${{ fromJSON(steps.audit.outputs.critical) > 0 }}
+        run: echo "block the release"
+```
+
+## Testing it for free
+
+The agent call is the only part of a run that costs money. `dry-run: true` skips
+it — and skips installing the agent, scanners and typst with it — then fabricates
+a findings file so everything downstream runs for real:
+
+```yaml
+      - uses: AegiLabs/aegi-action@v1
+        with:
+          dry-run: true          # no key needed, no quota spent
+          fail-on: none
+```
+
+The synthetic findings are anchored to files that actually exist in the target,
+picked at runtime, with line numbers inside each file's real length — so the
+`file:line` annotations resolve exactly as they would on a real run. There is one
+finding per severity, so all three annotation levels and every `fail-on`
+threshold get exercised. Everything it writes is stamped `DRY RUN`, and it is
+deterministic for a given repo.
+
+Use it to verify a new workflow before spending anything. Our own CI runs the
+real composite action this way on every push (`dry-run` job in
+`.github/workflows/aegi-action.yml`), which is what keeps the wiring — step
+order, `if:` guards, outputs, artifact, gate — under continuous test without a
+token bill.
+
+## How it behaves
+
+- **The report is written to `$RUNNER_TEMP`,** never the workspace — the audit
+  is read-only and won't leave the repo dirty for later steps.
+- **The agent's exit code is not the gate.** A truncated run (turn cap) or a
+  partial failure can still have produced real findings, so the gate is
+  `annotate.py` reading what was actually written. A run that produced no
+  structured findings warns rather than fails — that's a tooling miss, not a
+  security verdict.
+- **One install.** The audit is `npm install -g aegilabs`; Python is used only
+  for this action's own annotation and dry-run helpers.
+- **Missing tools never fail the job.** Scanners and typst install best-effort
+  and warn on failure; `aegi` degrades to LLM-only findings and an HTML report.
+  Non-Linux runners skip the tool install entirely and still audit.
+- **Annotations need a real path.** GitHub silently drops an annotation whose
+  `file=` it can't resolve, so a finding whose `asset` doesn't exist in the
+  workspace (or is a URL) is emitted without a file and shows up in the log and
+  summary instead. This is why the findings schema carries `line`.
+- **Quota:** every run debits your token quota, like any other audit. On a busy
+  repo, prefer `pull_request` over `push`, and consider `paths:` filters.
+
+> **Installs the `aegilabs` npm package** (the command it provides is `aegi`).
+> The agent runtime ships inside it, so the action installs one thing and needs
+> no separate agent CLI.
+
+## Distribution
+
+This repository is the action's only home — there is no copy inside the product
+repo to keep in sync. An action in a private repo can only be used by repos in
+the same organisation, so the public home is what makes the action reachable at
+all; our own dogfood workflow consumes `@v1` from here like any customer would.
+
+Nothing here is secret: the tradecraft prompt stays server-side in the proxy, and
+the audit itself installs from npm (`npm install -g aegilabs`).
+
+Releasing: land on `main`, then move the major tag.
+
+```bash
+git tag -f v1 && git push -f origin v1
+```
+
+## Tests
+
+```bash
+python tests/test_annotate.py
+```
+
+Covers the dry-run fixture feeding the real pipeline, annotation escaping,
+`file:line` resolution (including paths that don't exist and traversal
+attempts), the summary table, step outputs, and the `fail-on` gate. CI runs it on
+every push, alongside a full dry-run of the composite action itself.
+
+A real audit — live agent, real quota — is exercised by the **manual** `aegi
+action e2e` workflow in the private product repo, which has the intentionally
+vulnerable demo target and the `AEGI_KEY` secret, and which reaches this action
+through `@v1`.
+
+## License
+
+[PolyForm Internal Use 1.0.0](LICENSE.md). Run it in your own CI, commercially,
+and modify it for your own use; you may not redistribute it or offer it to third
+parties as a service.

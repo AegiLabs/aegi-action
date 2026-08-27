@@ -1,0 +1,246 @@
+name: "AegiLabs security audit"
+description: >-
+  Run the AegiLabs audit agent over this repository in CI. Findings land as
+  inline PR annotations and a job summary; the branded PDF report is uploaded
+  as an artifact. The repo is never cloned to us — it is audited in your own
+  runner — but the code the agent reads is sent to the model as context.
+author: AegiLabs
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  key:
+    description: >-
+      Your Aegi key (aegi_live_...). Store it as a repository secret. Not needed
+      when dry-run is true.
+    required: false
+    default: ""
+  dry-run:
+    description: >-
+      Skip the agent entirely and fabricate findings instead. Costs nothing and
+      calls no model, but exercises the whole reporting path — annotations, job
+      summary, artifact, PR comment, fail-on gate. Use it to verify wiring.
+    required: false
+    default: "false"
+  target:
+    description: >-
+      What to audit: a path in the repo (default '.') for a static audit, or a
+      URL for a live assessment. A URL also requires confirm-authorized: true.
+    required: false
+    default: "."
+  lang:
+    description: "Report language: en or sv."
+    required: false
+    default: "en"
+  max-turns:
+    description: >-
+      Agent turn cap. Higher digs deeper but costs more tokens against your
+      quota; raise it for large repos.
+    required: false
+    default: "30"
+  fail-on:
+    description: >-
+      Fail the job when a finding of this severity or worse is present:
+      critical | high | medium | low | info | none.
+    required: false
+    default: "critical"
+  scanners:
+    description: >-
+      Comma-separated scanners to install and run for grounding. Empty string
+      installs none (findings become LLM-only).
+      Available: gitleaks, osv-scanner, semgrep, trufflehog.
+    required: false
+    default: "gitleaks,osv-scanner,semgrep"
+  pdf:
+    description: "Install typst so the report is a branded PDF (else HTML)."
+    required: false
+    default: "true"
+  upload-artifact:
+    description: "Upload the report, findings JSON and transcript as an artifact."
+    required: false
+    default: "true"
+  artifact-name:
+    description: "Name of the uploaded artifact."
+    required: false
+    default: "aegi-report"
+  comment-pr:
+    description: >-
+      Post (and keep updating) a summary comment on the pull request. Needs
+      `permissions: pull-requests: write` on the job.
+    required: false
+    default: "false"
+  confirm-authorized:
+    description: >-
+      Confirm you are authorized to actively security-test the target. Required
+      only when `target` is a URL; repo audits never need it.
+    required: false
+    default: "false"
+  aegi-version:
+    description: >-
+      Pin the `aegilabs` npm release, e.g. '0.2.0'. Empty installs the latest.
+      Pin it if you want a reproducible gate.
+    required: false
+    default: ""
+  node-version:
+    description: "Node used to run aegi (needs 20+)."
+    required: false
+    default: "24"
+  python-version:
+    description: >-
+      Python for this action's own helper scripts (annotations, dry-run
+      fixture). The audit itself no longer needs Python.
+    required: false
+    default: "3.11"
+  proxy:
+    description: "Override the metering proxy URL. Internal/staging use only."
+    required: false
+    default: ""
+
+outputs:
+  critical:
+    description: "Number of critical findings."
+    value: ${{ steps.report.outputs.critical }}
+  high:
+    description: "Number of high findings."
+    value: ${{ steps.report.outputs.high }}
+  medium:
+    description: "Number of medium findings."
+    value: ${{ steps.report.outputs.medium }}
+  low:
+    description: "Number of low findings."
+    value: ${{ steps.report.outputs.low }}
+  info:
+    description: "Number of informational findings."
+    value: ${{ steps.report.outputs.info }}
+  total:
+    description: "Total number of findings."
+    value: ${{ steps.report.outputs.total }}
+  worst:
+    description: "Highest severity present, or 'none'."
+    value: ${{ steps.report.outputs.worst }}
+  report-dir:
+    description: "Directory holding the report, findings JSON and transcript."
+    value: ${{ steps.paths.outputs.dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve output paths
+      id: paths
+      shell: bash
+      run: |
+        dir="${RUNNER_TEMP}/aegi-report"
+        mkdir -p "$dir"
+        # Report goes to a temp dir, never the workspace: the audit is read-only
+        # and must not leave the repo dirty for later steps.
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+        echo "pdf=$dir/aegi-report.pdf" >> "$GITHUB_OUTPUT"
+        echo "data=$dir/aegi-report.data.json" >> "$GITHUB_OUTPUT"
+
+    # Python is only for this action's own helper scripts (annotate.py,
+    # dry_run.py). The audit itself no longer needs it — aegi is a Node package
+    # and the agent runtime ships inside it.
+    - uses: actions/setup-python@v7
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - uses: actions/setup-node@v7
+      if: ${{ inputs.dry-run != 'true' }}
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install the agent
+      if: ${{ inputs.dry-run != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # One install, no separate agent CLI: @anthropic-ai/claude-agent-sdk
+        # bundles the runtime as a platform-specific optional dependency.
+        spec="aegilabs"
+        # `[ -n "" ] && ...` exits 1, which under `set -e` would kill the step.
+        if [ -n "${{ inputs.aegi-version }}" ]; then
+          spec="aegilabs@${{ inputs.aegi-version }}"
+        fi
+        npm install -g "$spec"
+        aegi --help > /dev/null && echo "aegi installed: $(npm list -g aegilabs --depth=0 | tail -1)"
+
+    - name: Install scanners and typst
+      if: ${{ inputs.dry-run != 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: bash "${{ github.action_path }}/install_tools.sh" "${{ inputs.scanners }}" "${{ inputs.pdf }}"
+
+    - name: Fabricate a result (dry run)
+      if: ${{ inputs.dry-run == 'true' }}
+      shell: bash
+      run: |
+        echo "::notice title=aegi dry run::No model was called and no quota spent. Findings below are synthetic."
+        python "${{ github.action_path }}/dry_run.py" --target "${{ inputs.target }}" --out-dir "${{ steps.paths.outputs.dir }}"
+
+    - name: Run the audit
+      if: ${{ inputs.dry-run != 'true' }}
+      shell: bash
+      env:
+        AEGI_KEY: ${{ inputs.key }}
+        AEGI_PROXY_URL: ${{ inputs.proxy }}
+      run: |
+        set -uo pipefail
+        if [ -z "${AEGI_KEY:-}" ]; then
+          # Single-quoted: backticks inside a double-quoted string are command
+          # substitution, which would run `key:`, blank the word, and print a
+          # shell error into the customer's first-run failure message.
+          echo '::error title=aegi::no key supplied. Pass the `key:` input (a repository secret), or set dry-run: true to test the wiring for free.'
+          exit 1
+        fi
+        [ -z "${AEGI_PROXY_URL:-}" ] && unset AEGI_PROXY_URL
+        args=(--max-turns "${{ inputs.max-turns }}" --lang "${{ inputs.lang }}"
+              --out "${{ steps.paths.outputs.pdf }}")
+        [ "${{ inputs.confirm-authorized }}" = "true" ] && args+=(--yes)
+        # The agent's own exit status is not the gate — a truncated or partly
+        # failed run can still have produced real findings. The gate is the
+        # report step, which reads what was actually written.
+        aegi "${{ inputs.target }}" "${args[@]}" || \
+          echo "::warning::aegi exited non-zero; evaluating whatever findings it wrote"
+
+    - name: Annotate findings and gate
+      id: report
+      shell: bash
+      run: |
+        # asset paths are relative to the TARGET; GitHub resolves annotation
+        # paths against the repo root. Same thing only when target is '.'.
+        root="${{ github.workspace }}"
+        if [ -d "${{ github.workspace }}/${{ inputs.target }}" ]; then
+          root="${{ github.workspace }}/${{ inputs.target }}"
+        fi
+        python "${{ github.action_path }}/annotate.py" \
+          "${{ steps.paths.outputs.data }}" \
+          --root "$root" --repo-root "${{ github.workspace }}" \
+          --fail-on "${{ inputs.fail-on }}" \
+          --comment-file "${{ steps.paths.outputs.dir }}/comment.md" \
+          --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+    - name: Upload report
+      # always(): the report is most valuable exactly when the gate failed.
+      if: ${{ always() && inputs.upload-artifact == 'true' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ steps.paths.outputs.dir }}/aegi-report.*
+        if-no-files-found: warn
+
+    - name: Comment on the pull request
+      if: ${{ always() && inputs.comment-pr == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        body="${{ steps.paths.outputs.dir }}/comment.md"
+        [ -f "$body" ] || exit 0
+        # --edit-last keeps one rolling comment instead of one per push.
+        gh pr comment "${{ github.event.pull_request.number }}" \
+             --repo "${{ github.repository }}" --body-file "$body" --edit-last \
+          || gh pr comment "${{ github.event.pull_request.number }}" \
+             --repo "${{ github.repository }}" --body-file "$body"

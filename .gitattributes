@@ -1,0 +1,5 @@
+# Everything here ships into Linux GitHub runners. A CRLF shell script dies
+# there with a cryptic "$'\r': command not found", and CRLF leaks into the
+# multi-line strings annotate.py writes — so pin LF for the whole tree
+# regardless of the contributor's core.autocrlf.
+* text=auto eol=lf

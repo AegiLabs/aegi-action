@@ -1,0 +1,43 @@
+# A deeper scheduled audit that reports instead of gating: never fails the
+# build, keeps the PDF as a downloadable artifact, and opens an issue when
+# something critical shows up.
+#
+# Pairs well with pull-request-gate.yml — that one is a fast gate on the diff,
+# this one is a thorough weekly sweep of the whole repo.
+name: weekly security audit
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"          # Mondays 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: AegiLabs/aegi-action@v1
+        id: audit
+        with:
+          key: ${{ secrets.AEGI_KEY }}
+          max-turns: "60"                    # dig deeper than the PR gate
+          scanners: gitleaks,osv-scanner,semgrep,trufflehog
+          fail-on: none                      # report, don't block
+          artifact-name: aegi-weekly-report
+
+      - name: Open an issue on critical findings
+        if: ${{ fromJSON(steps.audit.outputs.critical) > 0 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIR: ${{ steps.audit.outputs.report-dir }}
+        run: |
+          gh issue create \
+            --title "Weekly audit: ${{ steps.audit.outputs.critical }} critical finding(s)" \
+            --body-file "$DIR/comment.md" \
+            --label security

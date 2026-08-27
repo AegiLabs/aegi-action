@@ -1,0 +1,65 @@
+# Checks for the action. Both jobs are free — nothing here spends token quota.
+#   test    — the data.json -> annotations/gate bridge, plus YAML/shell lint.
+#   dry-run — the real composite action, start to finish, with the agent call
+#             replaced by fabricated findings. Keeps the wiring (step order,
+#             `if:` guards, outputs, artifact, gate) under continuous test.
+#
+# The real-audit e2e lives in the private product repo, which has the vulnerable
+# demo target and the AEGI_KEY secret, and consumes this action via `@v1` — the
+# same path a customer takes.
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Bridge tests
+        run: python tests/test_annotate.py
+      - run: python -m pip install --quiet pyyaml
+      - name: action.yml and examples parse as YAML
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          try:
+              import yaml
+          except ImportError:
+              sys.exit("pyyaml missing")
+          for p in sorted(pathlib.Path(".").rglob("*.yml")):
+              yaml.safe_load(p.read_text(encoding="utf-8"))
+              print("ok", p)
+          PY
+      - name: install_tools.sh is valid bash with LF endings
+        run: |
+          bash -n install_tools.sh
+          # A CRLF shell script fails on a Linux runner with a cryptic
+          # "\r: command not found" — catch it here instead.
+          ! grep -q $'\r' install_tools.sh
+
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Audits this repo itself. dry_run.py anchors its synthetic findings to
+      # files that actually exist in the target, so any target works.
+      - uses: ./
+        id: audit
+        with:
+          dry-run: true
+          target: .
+          fail-on: none
+          artifact-name: aegi-dry-run-report
+      - name: The action must have produced counts
+        run: |
+          set -euo pipefail
+          echo "worst=${{ steps.audit.outputs.worst }} total=${{ steps.audit.outputs.total }}"
+          [ "${{ steps.audit.outputs.total }}" = "5" ]
+          [ "${{ steps.audit.outputs.worst }}" = "critical" ]
