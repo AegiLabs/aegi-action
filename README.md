@@ -144,6 +144,12 @@ Things worth knowing before you turn it on:
   source still has to be rotated.
 - **The fix PR runs even when the gate failed.** That is the point: a failing
   `fail-on` is exactly when you want the patch. The job still fails.
+- **You must let Actions open pull requests.** Enable **Settings → Actions →
+  General → Workflow permissions → "Allow GitHub Actions to create and approve
+  pull requests"**. It is off by default, and without it `gh pr create` fails
+  with a bare `GitHub Actions is not permitted to create or approve pull
+  requests`. The fixes are still pushed to the branch when this happens, so
+  nothing is lost — the action says so and names the branch.
 - **`GITHUB_TOKEN` pushes do not trigger workflows.** GitHub suppresses that on
   purpose, so your own CI won't run on the fix PR unless you push it with a PAT
   or a GitHub App token — pass one via `actions/checkout`'s `token:` input.

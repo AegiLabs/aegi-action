@@ -15,6 +15,10 @@ concurrency:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    # Also required, and NOT expressible here: Settings -> Actions -> General ->
+    # Workflow permissions -> "Allow GitHub Actions to create and approve pull
+    # requests". Off by default; without it the branch is pushed but the PR
+    # cannot be opened.
     permissions:
       contents: write             # push the fix branch
       pull-requests: write        # open the fix PR, and comment

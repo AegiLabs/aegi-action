@@ -396,7 +396,24 @@ runs:
         args=(--repo "${{ github.repository }}" --base "$base" --head "$branch"
               --title "$title" --body-file "$body")
         if [ "${{ inputs.fix-draft }}" = "true" ]; then args+=(--draft); fi
-        url="$(gh pr create "${args[@]}")"
+        # The branch is already pushed by here, so a failure now loses only the
+        # PR — and the default cause is a repo setting, not anything in the
+        # workflow. GitHub returns a bare GraphQL error for it, which sends
+        # people looking in the wrong place; name the checkbox instead.
+        if ! url="$(gh pr create "${args[@]}" 2>&1)"; then
+          case "$url" in
+            *"not permitted to create or approve pull requests"*)
+              echo "::error title=aegi fix::GitHub Actions may not open pull requests in this repository. Enable Settings -> Actions -> General -> Workflow permissions -> \"Allow GitHub Actions to create and approve pull requests\", or check out with a PAT/App token. The fixes are pushed and safe on branch $branch — open the PR by hand if you prefer."
+              ;;
+            *)
+              echo "::error title=aegi fix::could not open the pull request: $url"
+              echo "::notice::the fixes are pushed on branch $branch and are not lost."
+              ;;
+          esac
+          echo "url=" >> "$GITHUB_OUTPUT"
+          echo "fixed=0" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
         echo "Opened $url"
         echo "url=$url" >> "$GITHUB_OUTPUT"
         echo "[Fix PR]($url)" >> "$GITHUB_STEP_SUMMARY"
