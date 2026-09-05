@@ -24,6 +24,8 @@ jobs:
           python-version: "3.11"
       - name: Bridge tests
         run: python tests/test_annotate.py
+      - name: Fix-count helper
+        run: python tests/test_count_fixed.py
       - run: python -m pip install --quiet pyyaml
       - name: action.yml and examples parse as YAML
         run: |
