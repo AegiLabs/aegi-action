@@ -230,7 +230,12 @@ runs:
       shell: bash
       run: |
         echo "::notice title=aegi dry run::No model was called and no quota spent. Findings below are synthetic."
-        python "${{ github.action_path }}/dry_run.py" --target "${{ inputs.target }}" --out-dir "${{ steps.paths.outputs.dir }}"
+        args=(--target "${{ inputs.target }}" --out-dir "${{ steps.paths.outputs.dir }}")
+        # With fix: on, fabricate a patch too. The branch/commit/push/PR steps
+        # then run for real and open an actual pull request — the half of the
+        # feature that costs nothing and is most likely to be miswired.
+        if [ "${{ inputs.fix }}" = "true" ]; then args+=(--fix); fi
+        python "${{ github.action_path }}/dry_run.py" "${args[@]}"
 
     - name: Run the audit
       if: ${{ inputs.dry-run != 'true' }}
@@ -334,7 +339,9 @@ runs:
 
     - name: Open a pull request with the fixes
       id: fixpr
-      if: ${{ always() && inputs.fix == 'true' && inputs.dry-run != 'true' }}
+      # No dry-run guard: in a dry run the patch was fabricated above, and
+      # opening the pull request from it is precisely what we want to exercise.
+      if: ${{ always() && inputs.fix == 'true' }}
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -382,9 +389,12 @@ runs:
         body="${{ steps.paths.outputs.dir }}/aegi-fix.md"
         [ -f "$body" ] || echo "## Automated security fixes -- see the run for details." > "$body"
 
+        title="Security fixes from aegi (run ${{ github.run_id }})"
+        if [ "${{ inputs.dry-run }}" = "true" ]; then
+          title="[DRY RUN] $title — wiring test, fixes nothing"
+        fi
         args=(--repo "${{ github.repository }}" --base "$base" --head "$branch"
-              --title "Security fixes from aegi (run ${{ github.run_id }})"
-              --body-file "$body")
+              --title "$title" --body-file "$body")
         if [ "${{ inputs.fix-draft }}" = "true" ]; then args+=(--draft); fi
         url="$(gh pr create "${args[@]}")"
         echo "Opened $url"
