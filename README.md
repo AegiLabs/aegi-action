@@ -9,7 +9,8 @@ machine" in `product/aegi/README.md` — it applies identically here, with the
 runner in place of a laptop.
 
 Findings come back three ways: inline annotations on the pull request diff, a
-job summary table, and the branded PDF report as a run artifact.
+job summary table, and the branded PDF report as a run artifact. With
+`fix: true` they come back a fourth way — as a pull request that fixes them.
 
 ```yaml
 # .github/workflows/security.yml
@@ -48,6 +49,12 @@ More variants in [`examples/`](examples/).
 | `upload-artifact` | `true` | Upload report + findings JSON + transcript. |
 | `artifact-name` | `aegi-report` | Artifact name (change it if a matrix runs several audits). |
 | `comment-pr` | `false` | Post one rolling summary comment on the PR. Needs `pull-requests: write`. |
+| `fix` | `false` | After reporting, run a **second** agent pass that fixes the findings and open a PR with the patch. Spends a second run of quota. See [Fixing what it finds](#fixing-what-it-finds). |
+| `fix-severity` | `high` | Only fix this severity or worse. |
+| `fix-branch` | run-derived | Branch to push fixes to. Default `aegi/fix-<run_id>` — never collides, never reuses a branch someone has since edited. |
+| `fix-base` | audited branch | Branch the fix PR targets. Default is the branch that was audited, so on a `pull_request` run the fixes stack onto the PR under review. |
+| `fix-draft` | `true` | Open the fix PR as a draft. |
+| `fix-max-turns` | `max-turns` | Turn cap for the fix pass alone. |
 | `confirm-authorized` | `false` | Confirms authorization to actively test a URL target. Repo audits never need it. |
 | `aegi-version` | latest | Pin the `aegilabs` npm release, e.g. `0.2.0`. Pin it for reproducible gates. |
 | `node-version` | `24` | Node used to run the audit (needs 20+). |
@@ -57,7 +64,8 @@ More variants in [`examples/`](examples/).
 ## Outputs
 
 `critical`, `high`, `medium`, `low`, `info`, `total`, `worst` (highest severity
-present, or `none`), and `report-dir`. Useful when you'd rather gate yourself
+present, or `none`), `report-dir`, plus `fix-pr` (the fix pull request's URL, or
+empty) and `fixed` (how many findings it changed code for). Useful when you'd rather gate yourself
 than use `fail-on`:
 
 ```yaml
@@ -95,6 +103,52 @@ real composite action this way on every push (`dry-run` job in
 `.github/workflows/aegi-action.yml`), which is what keeps the wiring — step
 order, `if:` guards, outputs, artifact, gate — under continuous test without a
 token bill.
+
+## Fixing what it finds
+
+`fix: true` adds a second agent pass after the report. It reads the findings the
+audit just produced, edits the checkout to fix them, commits to a new branch and
+opens a pull request whose body says what changed and what it refused to touch.
+
+```yaml
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write           # push the fix branch
+      pull-requests: write      # open the PR (and comment)
+    steps:
+      - uses: actions/checkout@v7
+      - uses: AegiLabs/aegi-action@v1
+        with:
+          key: ${{ secrets.AEGI_KEY }}
+          fail-on: high
+          fix: true
+          fix-severity: high    # don't open a PR over four `info` findings
+```
+
+Things worth knowing before you turn it on:
+
+- **It is a second billed run.** Roughly doubles what an audited PR costs, which
+  is why `fix-severity` defaults to `high` rather than `info`.
+- **The audit agent still never writes.** The auditor is read-only by
+  construction and stays that way; the fixer is a separate run that starts from
+  findings the audit already committed to, so nothing that edited your code also
+  decided what was wrong with it.
+- **No agent ever runs a git command.** `aegi fix` only edits files. Branching,
+  committing and pushing are plain shell in this action, and only paths inside
+  `target` are staged.
+- **Draft by default.** These are model-written patches. The PR body says so, in
+  the body, every time — including that a leaked credential it removed from the
+  source still has to be rotated.
+- **The fix PR runs even when the gate failed.** That is the point: a failing
+  `fail-on` is exactly when you want the patch. The job still fails.
+- **`GITHUB_TOKEN` pushes do not trigger workflows.** GitHub suppresses that on
+  purpose, so your own CI won't run on the fix PR unless you push it with a PAT
+  or a GitHub App token — pass one via `actions/checkout`'s `token:` input.
+- **Skipped in `dry-run`,** which calls no model and so has nothing to fix.
+- **Nothing to fix, no PR.** If the pass changes no file, the step says so and
+  `fix-pr` comes back empty.
 
 ## How it behaves
 
@@ -141,6 +195,7 @@ git tag -f v1 && git push -f origin v1
 
 ```bash
 python tests/test_annotate.py
+python tests/test_count_fixed.py
 ```
 
 Covers the dry-run fixture feeding the real pipeline, annotation escaping,

@@ -70,6 +70,43 @@ inputs:
       `permissions: pull-requests: write` on the job.
     required: false
     default: "false"
+  fix:
+    description: >-
+      After reporting, run a second agent pass that fixes the findings and open
+      a pull request with the patch. Costs a second run against your quota.
+      Needs `permissions: contents: write` and `pull-requests: write`.
+    required: false
+    default: "false"
+  fix-severity:
+    description: >-
+      Only fix findings at this severity or worse: critical | high | medium |
+      low | info. Keep it high or worse unless you want a large diff.
+    required: false
+    default: "high"
+  fix-branch:
+    description: >-
+      Branch to push the fixes to. Empty derives one from the run
+      (aegi/fix-<run_id>), which never collides and never reuses a branch a
+      human has since edited.
+    required: false
+    default: ""
+  fix-base:
+    description: >-
+      Branch the fix PR targets. Empty means the branch that was audited — on a
+      pull_request run that is the PR's own head branch, so the fixes stack onto
+      the PR under review rather than jumping ahead of it to the default branch.
+    required: false
+    default: ""
+  fix-draft:
+    description: >-
+      Open the fix PR as a draft. These are LLM-written patches; a draft makes
+      "read this before you trust it" the default posture.
+    required: false
+    default: "true"
+  fix-max-turns:
+    description: "Turn cap for the fix pass. Empty reuses max-turns."
+    required: false
+    default: ""
   confirm-authorized:
     description: >-
       Confirm you are authorized to actively security-test the target. Required
@@ -119,6 +156,12 @@ outputs:
   worst:
     description: "Highest severity present, or 'none'."
     value: ${{ steps.report.outputs.worst }}
+  fix-pr:
+    description: "URL of the pull request holding the fixes, or empty if none was opened."
+    value: ${{ steps.fixpr.outputs.url }}
+  fixed:
+    description: "Number of findings the fix pass changed code for."
+    value: ${{ steps.fixpr.outputs.fixed }}
   report-dir:
     description: "Directory holding the report, findings JSON and transcript."
     value: ${{ steps.paths.outputs.dir }}
@@ -221,6 +264,111 @@ runs:
           --comment-file "${{ steps.paths.outputs.dir }}/comment.md" \
           --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+    # ---------------------------------------------------------------- fixes
+    #
+    # A second agent pass, deliberately: the audit agent is read-only by
+    # construction and stays that way, so the fixer works only from findings the
+    # audit already committed to. It edits the checkout; the git half below is
+    # plain shell, so no agent ever runs a git write command.
+    #
+    # always(): the gate above may already have failed the job, and a failing
+    # gate is exactly when the fix PR is worth having.
+    - name: Fix the findings
+      id: fix
+      if: ${{ always() && inputs.fix == 'true' && inputs.dry-run != 'true' }}
+      shell: bash
+      env:
+        AEGI_KEY: ${{ inputs.key }}
+        AEGI_PROXY_URL: ${{ inputs.proxy }}
+      run: |
+        set -uo pipefail
+        [ -z "${AEGI_PROXY_URL:-}" ] && unset AEGI_PROXY_URL
+        root="${{ github.workspace }}"
+        if [ -d "${{ github.workspace }}/${{ inputs.target }}" ]; then
+          root="${{ github.workspace }}/${{ inputs.target }}"
+        fi
+        data="${{ steps.paths.outputs.data }}"
+        if [ ! -f "$data" ]; then
+          echo "::notice title=aegi fix::the audit wrote no findings file; nothing to fix."
+          exit 0
+        fi
+        turns="${{ inputs.fix-max-turns }}"
+        [ -z "$turns" ] && turns="${{ inputs.max-turns }}"
+        # --out into the temp dir, not the workspace: the only thing that may
+        # dirty the checkout is the fix itself, or the commit below would sweep
+        # our own summary into the customer's PR.
+        args=(--findings "$data" --severity "${{ inputs.fix-severity }}"
+              --max-turns "$turns"
+              --out "${{ steps.paths.outputs.dir }}/aegi-fix.md")
+        aegi fix "$root" "${args[@]}" ||
+          echo "::warning::aegi fix exited non-zero; committing whatever it did change"
+
+    - name: Open a pull request with the fixes
+      id: fixpr
+      if: ${{ always() && inputs.fix == 'true' && inputs.dry-run != 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        cd "${{ github.workspace }}"
+
+        # Stage only inside the audited target. The fixer is told to stay there,
+        # and `git add -A` over the whole workspace would happily commit anything
+        # an earlier step happened to drop in the checkout.
+        path="${{ inputs.target }}"
+        [ -d "$path" ] || path="."
+        git add -A -- "$path"
+        if git diff --cached --quiet; then
+          echo "::notice title=aegi fix::no file changed — nothing to open a PR for."
+          echo "url=" >> "$GITHUB_OUTPUT"
+          echo "fixed=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        base="${{ inputs.fix-base }}"
+        if [ -z "$base" ]; then
+          # The branch that was actually audited. On a pull_request run that is
+          # the PR's head branch, so fixes land on the PR under review instead of
+          # racing ahead of it onto the default branch.
+          base="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+        fi
+        # `[ ... ] && x=y` returns 1 when the test fails, and under `set -e` that
+        # kills the step. Every conditional in this block is written as an `if`
+        # for that reason — the same trap that once broke the install step.
+        branch="${{ inputs.fix-branch }}"
+        if [ -z "$branch" ]; then branch="aegi/fix-${{ github.run_id }}"; fi
+
+        git config user.name "aegi[bot]"
+        git config user.email "noreply@aegilabs.se"
+        git checkout -b "$branch"
+        # Separate -m flags, not one embedded newline: a multi-line string in a
+        # YAML block scalar has to be indented, and an unindented continuation
+        # silently ends the scalar and breaks the whole action file.
+        git commit -q -m "fix: apply aegi security findings" \
+          -m "Written by the AegiLabs audit agent from its own findings on this branch. Review before merging: these edits came from a model." \
+          -m "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        git push -q origin "$branch"
+
+        body="${{ steps.paths.outputs.dir }}/aegi-fix.md"
+        [ -f "$body" ] || echo "## Automated security fixes -- see the run for details." > "$body"
+
+        args=(--repo "${{ github.repository }}" --base "$base" --head "$branch"
+              --title "Security fixes from aegi (run ${{ github.run_id }})"
+              --body-file "$body")
+        if [ "${{ inputs.fix-draft }}" = "true" ]; then args+=(--draft); fi
+        url="$(gh pr create "${args[@]}")"
+        echo "Opened $url"
+        echo "url=$url" >> "$GITHUB_OUTPUT"
+        echo "[Fix PR]($url)" >> "$GITHUB_STEP_SUMMARY"
+
+        n=0
+        j="${{ steps.paths.outputs.dir }}/aegi-fix.json"
+        if [ -f "$j" ]; then
+          n="$(python "${{ github.action_path }}/count_fixed.py" "$j")"
+        fi
+        echo "fixed=$n" >> "$GITHUB_OUTPUT"
+
     - name: Upload report
       # always(): the report is most valuable exactly when the gate failed.
       if: ${{ always() && inputs.upload-artifact == 'true' }}
@@ -229,6 +377,7 @@ runs:
         name: ${{ inputs.artifact-name }}
         path: |
           ${{ steps.paths.outputs.dir }}/aegi-report.*
+          ${{ steps.paths.outputs.dir }}/aegi-fix.*
         if-no-files-found: warn
 
     - name: Comment on the pull request

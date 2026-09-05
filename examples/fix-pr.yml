@@ -1,0 +1,45 @@
+# Audit every pull request, and open a second PR that fixes what was found.
+#
+# This costs two agent runs per audited PR, not one — the audit, then the fix
+# pass. `fix-severity: high` keeps that second run from being spent on `info`
+# findings nobody was going to merge a patch for.
+name: security
+
+on:
+  pull_request:
+
+concurrency:
+  group: aegi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write             # push the fix branch
+      pull-requests: write        # open the fix PR, and comment
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # gitleaks also scans history
+          # GitHub deliberately does not run workflows on pushes made with
+          # GITHUB_TOKEN, so the fix PR would arrive with no CI of its own.
+          # Check out with a PAT or GitHub App token if you want it checked:
+          #   token: ${{ secrets.AEGI_FIX_TOKEN }}
+
+      - uses: AegiLabs/aegi-action@v1
+        id: audit
+        with:
+          key: ${{ secrets.AEGI_KEY }}
+          fail-on: high
+          comment-pr: true
+          fix: true
+          fix-severity: high
+          aegi-version: "0.2.0"   # pin so the gate is reproducible
+
+      # The fix PR is opened even when the gate above failed — that is exactly
+      # when you want it — so read the output with always().
+      - name: Point at the fix
+        if: ${{ always() && steps.audit.outputs.fix-pr != '' }}
+        run: |
+          echo "Fixes for ${{ steps.audit.outputs.fixed }} finding(s): ${{ steps.audit.outputs.fix-pr }}"
