@@ -70,6 +70,16 @@ inputs:
       `permissions: pull-requests: write` on the job.
     required: false
     default: "false"
+  eu:
+    description: >-
+      EU data-residency mode. Pins the model to an EU-hosted provider, proves
+      the proxy answers from inside the EU before any code is sent, and runs the
+      scanners with the flags that keep code, secrets and your dependency graph
+      off US services. Fails the run rather than quietly downgrading.
+      Note that a GitHub-hosted runner is itself largely US compute — see
+      "EU data residency" in the README before relying on this.
+    required: false
+    default: "false"
   fix:
     description: >-
       After reporting, run a second agent pass that fixes the findings and open
@@ -241,6 +251,22 @@ runs:
         args=(--max-turns "${{ inputs.max-turns }}" --lang "${{ inputs.lang }}"
               --out "${{ steps.paths.outputs.pdf }}")
         [ "${{ inputs.confirm-authorized }}" = "true" ] && args+=(--yes)
+        if [ "${{ inputs.eu }}" = "true" ]; then
+          args+=(--eu)
+          # The runner is not ours and is not covered by the residency claim.
+          # `aegi --eu` guarantees where the *model* traffic goes; it cannot
+          # move the machine holding the checkout. Say so where someone will
+          # actually read it, rather than only in the README.
+          if [ "${{ runner.environment }}" = "github-hosted" ]; then
+            echo "::warning title=aegi --eu::the model traffic stays in the EU, but this GitHub-hosted runner is largely US compute — your source sits on US infrastructure before it ever reaches us. Use a self-hosted EU runner for an end-to-end EU claim."
+          fi
+          # Under --eu, semgrep is skipped unless a local ruleset is supplied,
+          # because `--config auto` fetches rules from semgrep.dev and uploads
+          # scan metadata. A quietly missing scanner reads as "clean".
+          if [ -z "${AEGI_SEMGREP_CONFIG:-}" ] && [[ "${{ inputs.scanners }}" == *semgrep* ]]; then
+            echo "::warning title=aegi --eu::semgrep grounding is withheld — set the AEGI_SEMGREP_CONFIG env var to a local ruleset to re-enable it under --eu."
+          fi
+        fi
         # The agent's own exit status is not the gate — a truncated or partly
         # failed run can still have produced real findings. The gate is the
         # report step, which reads what was actually written.
@@ -300,6 +326,9 @@ runs:
         args=(--findings "$data" --severity "${{ inputs.fix-severity }}"
               --max-turns "$turns"
               --out "${{ steps.paths.outputs.dir }}/aegi-fix.md")
+        # The fix pass re-reads and re-sends the same source the audit did, so
+        # it carries the same residency promise or the promise is worthless.
+        if [ "${{ inputs.eu }}" = "true" ]; then args+=(--eu); fi
         aegi fix "$root" "${args[@]}" ||
           echo "::warning::aegi fix exited non-zero; committing whatever it did change"
 

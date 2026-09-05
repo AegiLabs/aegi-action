@@ -49,6 +49,7 @@ More variants in [`examples/`](examples/).
 | `upload-artifact` | `true` | Upload report + findings JSON + transcript. |
 | `artifact-name` | `aegi-report` | Artifact name (change it if a matrix runs several audits). |
 | `comment-pr` | `false` | Post one rolling summary comment on the PR. Needs `pull-requests: write`. |
+| `eu` | `false` | **EU data residency.** Pins the model to an EU-hosted provider, proves the proxy answers from the EU before sending code, and de-fangs the scanners. See [EU data residency](#eu-data-residency) — the runner itself is the catch. |
 | `fix` | `false` | After reporting, run a **second** agent pass that fixes the findings and open a PR with the patch. Spends a second run of quota. See [Fixing what it finds](#fixing-what-it-finds). |
 | `fix-severity` | `high` | Only fix this severity or worse. |
 | `fix-branch` | run-derived | Branch to push fixes to. Default `aegi/fix-<run_id>` — never collides, never reuses a branch someone has since edited. |
@@ -149,6 +150,36 @@ Things worth knowing before you turn it on:
 - **Skipped in `dry-run`,** which calls no model and so has nothing to fix.
 - **Nothing to fix, no PR.** If the pass changes no file, the step says so and
   `fix-pr` comes back empty.
+
+## EU data residency
+
+`eu: true` passes `--eu` to both the audit and, if enabled, the fix pass. That
+pins the model to an EU-hosted provider, verifies the proxy is answering from
+inside the EU *before* any code is sent, and switches the scanners to flags that
+keep code, secrets and your dependency graph off US services. It fails the run
+rather than quietly downgrading.
+
+```yaml
+      - uses: AegiLabs/aegi-action@v1
+        with:
+          key: ${{ secrets.AEGI_KEY }}
+          eu: true
+```
+
+**Read this before you rely on it.** `--eu` guarantees where the *model traffic*
+goes. It cannot move the machine holding your checkout:
+
+- **A GitHub-hosted runner is largely US compute.** Your source is cloned onto US
+  infrastructure by the `checkout` step, before `aegi` runs at all. For an
+  end-to-end EU claim you need a **self-hosted runner in the EU**. The action
+  emits a warning when it sees `eu: true` on a GitHub-hosted runner, so this
+  can't be true silently.
+- **semgrep grounding is withheld** unless you supply a local ruleset —
+  `--config auto` fetches rules from semgrep.dev and uploads scan metadata. Set
+  `AEGI_SEMGREP_CONFIG` on the step to a ruleset path to keep it; otherwise
+  semgrep is skipped, and the action warns rather than letting a missing scanner
+  read as "clean".
+- **The claim is "EU", never "Sweden".** Model traffic is processed in Germany.
 
 ## How it behaves
 
