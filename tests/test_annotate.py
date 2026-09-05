@@ -144,6 +144,40 @@ def test_subdir_target_resolves_against_the_repo_root():
     assert A.locate({"asset": "../../../../../etc/passwd"}, target, repo) == (None, None)
 
 
+def test_dry_run_fabricates_a_real_but_harmless_patch():
+    """`--fix` in a dry run must produce an actual diff, and never corrupt a file.
+
+    The point of it is that the branch/commit/push/PR steps then run for real, so
+    "there is a diff" is the whole contract. JSON is the trap: it has no comment
+    syntax, and the fabricated findings routinely anchor to package.json.
+    """
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+    import dry_run
+
+    src = pathlib.Path(tempfile.mkdtemp()) / "repo"
+    (src / "src").mkdir(parents=True)
+    (src / "src" / "app.js").write_text("const a = 1;\n", encoding="utf-8")
+    (src / "package.json").write_text('{"name": "x"}\n', encoding="utf-8")
+    before = (src / "package.json").read_text(encoding="utf-8")
+
+    rd = dry_run.build(src)
+    fixed, asset = dry_run.fabricate_fix(src, rd)
+
+    assert fixed is not None and asset, "a dry-run fix must produce a change"
+    assert not asset.endswith(".json"), "JSON has no comment syntax; must be skipped"
+    assert (src / "package.json").read_text(encoding="utf-8") == before
+
+    touched = (src / asset).read_text(encoding="utf-8")
+    assert dry_run.FIX_MARKER in touched
+    assert touched.endswith("\n")
+    # Exactly one line added — a dry run must not grow the diff over time.
+    assert touched.count(dry_run.FIX_MARKER) == 1
+
+    body = dry_run.fix_summary_md(fixed, asset)
+    assert "DRY RUN" in body and "Close this pull request" in body
+    assert asset in body
+
+
 def test_dry_run_feeds_the_pipeline():
     """The fabricated result must survive the real annotate/gate path — this is
     what makes the free CI self-test meaningful."""
@@ -181,4 +215,5 @@ if __name__ == "__main__":
     test_missing_data_is_not_a_failure()
     test_subdir_target_resolves_against_the_repo_root()
     test_dry_run_feeds_the_pipeline()
+    test_dry_run_fabricates_a_real_but_harmless_patch()
     print("ok - action bridge (locate, annotate, summary, gate) passes")

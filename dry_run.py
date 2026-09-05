@@ -108,11 +108,76 @@ def build(target, seed=7):
     }
 
 
+# The marker the fabricated patch leaves behind. Deliberately a comment, on its
+# own line, in a file the fabricated findings already point at — so the diff is
+# real enough for git, GitHub and the PR body to be exercised, and trivial
+# enough that closing the PR is the whole cleanup.
+FIX_MARKER = "aegi dry run - synthetic change, safe to delete"
+
+COMMENT = {".py": "#", ".sh": "#", ".yml": "#", ".yaml": "#", ".toml": "#",
+           ".rb": "#", ".sql": "--"}
+
+
+def fabricate_fix(target, rd):
+    """Apply one harmless, real edit so the PR half of the action has a diff.
+
+    The fix pass is the only part of `fix: true` that costs money; branching,
+    committing and opening the pull request are free, and are exactly the parts
+    most likely to be miswired. Writing a genuine (if trivial) change here lets a
+    dry run exercise them for real — it opens an actual pull request.
+
+    JSON has no comment syntax, so it is skipped rather than corrupted.
+    """
+    for f in rd["findings"]:
+        asset = f.get("asset", "")
+        if not asset or "://" in asset:
+            continue
+        path = target / asset
+        suffix = path.suffix.lower()
+        if suffix == ".json" or not path.is_file():
+            continue
+        lead = COMMENT.get(suffix, "//")
+        try:
+            text = path.read_text(encoding="utf-8")
+            sep = "" if text.endswith("\n") else "\n"
+            path.write_text(text + sep + lead + " " + FIX_MARKER + "\n",
+                            encoding="utf-8")
+        except OSError:
+            continue
+        return f, asset
+    return None, None
+
+
+def fix_summary_md(fixed, asset):
+    """The PR body. Says loudly that it fixes nothing, because it fixes nothing."""
+    if not fixed:
+        return ("## Automated security fixes (DRY RUN)\n\n"
+                "No file in the target could take a synthetic edit, so no patch "
+                "was fabricated.\n")
+    return (
+        "## Automated security fixes (DRY RUN)\n\n"
+        "**No model was called and no quota was spent.** This pull request exists "
+        "only to prove the fix pipeline works end to end — branch, commit, push, "
+        "PR body, step outputs. The change below is a single comment line and "
+        "fixes nothing.\n\n"
+        "### Fixed\n\n"
+        "- **" + fixed["id"] + " — " + fixed["title"] + "** (`" + asset + "`)\n"
+        "  Appended one comment line marked `" + FIX_MARKER + "`.\n\n"
+        "---\n\n"
+        "**Close this pull request.** It is a wiring test, not a fix.\n"
+    )
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="fabricate an aegi result (no model calls)")
     ap.add_argument("--target", default=".", help="repo the fake findings point into")
     ap.add_argument("--out-dir", required=True, help="where to write the report files")
     ap.add_argument("--stem", default="aegi-report", help="filename stem, as aegi would use")
+    ap.add_argument("--fix", action="store_true",
+                    help="also fabricate a patch and its summary, so the fix and "
+                         "pull-request steps can run for real without a model")
+    ap.add_argument("--fix-stem", default="aegi-fix",
+                    help="filename stem for the fabricated fix summary")
     a = ap.parse_args(argv)
 
     target = pathlib.Path(a.target).resolve()
@@ -134,6 +199,19 @@ def main(argv=None):
         "<!doctype html><meta charset=utf-8><title>aegi dry run</title>"
         "<h1>Dry run</h1><p>No audit was performed. See the JSON for the "
         "synthetic findings.</p>", encoding="utf-8")
+
+    if a.fix:
+        fixed, asset = fabricate_fix(target, rd)
+        (out / f"{a.fix_stem}.md").write_text(
+            fix_summary_md(fixed, asset), encoding="utf-8")
+        entries = ([{"id": fixed["id"], "asset": asset,
+                     "note": f"DRY RUN - appended one comment line to {asset}."}]
+                   if fixed else [])
+        (out / f"{a.fix_stem}.json").write_text(
+            json.dumps({"fixed": entries, "skipped": []},
+                       ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"dry run: fabricated a patch in {asset}" if fixed
+              else "dry run: no file could take a synthetic edit")
 
     print(f"dry run: wrote {len(rd['findings'])} synthetic findings to {out}")
     for f in rd["findings"]:
